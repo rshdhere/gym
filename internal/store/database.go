@@ -53,7 +53,26 @@ type cachedSecret struct {
 	expiresAt time.Time
 }
 
-func Open(ctx context.Context) (*sql.DB, error) {
+// DB wraps *sql.DB to add helpers.
+type DB struct {
+	*sql.DB
+}
+
+type SecretProvider interface {
+	GetSecret(ctx context.Context, name string) (DBSecret, error)
+}
+
+type defaultSecretProvider struct{}
+
+func (defaultSecretProvider) GetSecret(ctx context.Context, name string) (DBSecret, error) {
+	return fetchDBSecret(ctx, name)
+}
+
+func Open(ctx context.Context) (*DB, error) {
+	return OpenWithProvider(ctx, defaultSecretProvider{})
+}
+
+func OpenWithProvider(ctx context.Context, provider SecretProvider) (*DB, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -67,19 +86,14 @@ func Open(ctx context.Context) (*sql.DB, error) {
 		return nil, err
 	}
 
-	dsn, secretUsed, err := resolveDSN(ctx, env)
+	dsn, secretUsed, err := resolveDSN(ctx, env, provider)
 	if err != nil {
 		return nil, err
 	}
 
-	db, err := sql.Open("pgx", dsn)
+	db, err := openWithRetry(ctx, dsn)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open database connection: %w", err)
-	}
-
-	if err := db.PingContext(ctx); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("database ping: %w", err)
+		return nil, err
 	}
 
 	configureConnectionPool(db)
@@ -90,10 +104,10 @@ func Open(ctx context.Context) (*sql.DB, error) {
 		"APP_ENV", rawEnv,
 	)
 
-	return db, nil
+	return &DB{DB: db}, nil
 }
 
-func resolveDSN(ctx context.Context, env string) (string, string, error) {
+func resolveDSN(ctx context.Context, env string, provider SecretProvider) (string, string, error) {
 	if env == localEnvVal {
 		return localDSNFromEnv(), "local-env-vars", nil
 	}
@@ -105,7 +119,7 @@ func resolveDSN(ctx context.Context, env string) (string, string, error) {
 		return "", "", err
 	}
 
-	secret, err := fetchDBSecret(ctx, secretName)
+	secret, err := provider.GetSecret(ctx, secretName)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to load database secret: %w", err)
 	}
@@ -119,6 +133,27 @@ func resolveDSN(ctx context.Context, env string) (string, string, error) {
 		secret.Database,
 		sslMode,
 	), secretName, nil
+}
+
+func openWithRetry(ctx context.Context, dsn string) (*sql.DB, error) {
+	var db *sql.DB
+	var err error
+
+	for i := 0; i < 3; i++ {
+		db, err = sql.Open("pgx", dsn)
+		if err == nil {
+			if err = db.PingContext(ctx); err == nil {
+				return db, nil
+			}
+			db.Close()
+		}
+
+		if i < 2 {
+			time.Sleep(time.Second * time.Duration(1<<i))
+		}
+	}
+
+	return nil, fmt.Errorf("failed to open database after retries: %w", err)
 }
 
 func localDSNFromEnv() string {
@@ -294,4 +329,16 @@ func configureConnectionPool(db *sql.DB) {
 	db.SetMaxOpenConns(maxOpen)
 	db.SetMaxIdleConns(maxIdle)
 	db.SetConnMaxLifetime(connLifetime)
+}
+
+// HealthCheck pings the database with a short timeout.
+func (db *DB) HealthCheck(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	return db.PingContext(ctx)
 }

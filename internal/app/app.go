@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log"
 	"net/http"
@@ -15,7 +14,7 @@ import (
 type Application struct {
 	Logger         *log.Logger
 	WorkoutHandler *api.WorkoutHandler
-	DB             *sql.DB
+	DB             *store.DB
 }
 
 func NewApplication(ctx context.Context) (*Application, error) {
