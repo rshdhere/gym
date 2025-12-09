@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -15,7 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
-	_ "github.com/jackc/pgx/v4/stdlib"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 type DBSecret struct {
@@ -29,7 +30,6 @@ type DBSecret struct {
 const (
 	secretNameProd    = "prod/gym/postgresql"
 	secretNameStaging = "stagging/gym/postgresql"
-	region            = "ap-south-1"
 
 	appEnvVar     = "APP_ENV"
 	localEnvVal   = "local"
@@ -84,7 +84,11 @@ func resolveDSN(ctx context.Context, env string) (string, string, error) {
 		return localDSNFromEnv(), "local-env-vars", nil
 	}
 
-	secretName := selectSecretName(env)
+	secretName, err := selectSecretName(env)
+	if err != nil {
+		return "", "", err
+	}
+
 	secret, err := fetchDBSecret(ctx, secretName)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to load database secret: %w", err)
@@ -92,8 +96,8 @@ func resolveDSN(ctx context.Context, env string) (string, string, error) {
 
 	return fmt.Sprintf(
 		"postgresql://%s:%s@%s:%s/%s?sslmode=require",
-		secret.Username,
-		secret.Password,
+		url.QueryEscape(secret.Username),
+		url.QueryEscape(secret.Password),
 		secret.Host,
 		secret.Port,
 		secret.Database,
@@ -168,19 +172,26 @@ func envLabel() (string, string, error) {
 	}
 }
 
-func selectSecretName(env string) string {
+func selectSecretName(env string) (string, error) {
 	if override := strings.TrimSpace(os.Getenv(secretNameEnvVar)); override != "" {
-		return override
+		return override, nil
 	}
 
 	switch env {
 	case stagingEnvVal:
-		return secretNameStaging
+		return secretNameStaging, nil
 	case prodEnvVal:
-		return secretNameProd
+		return secretNameProd, nil
 	default:
-		return secretNameProd
+		return "", fmt.Errorf("no secret name configured for env: %s", env)
 	}
+}
+
+func getAWSRegion() string {
+	if r := strings.TrimSpace(os.Getenv("AWS_REGION")); r != "" {
+		return r
+	}
+	return "ap-south-1"
 }
 
 func fetchDBSecret(ctx context.Context, name string) (DBSecret, error) {
@@ -188,7 +199,7 @@ func fetchDBSecret(ctx context.Context, name string) (DBSecret, error) {
 		return cached, nil
 	}
 
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(getAWSRegion()))
 	if err != nil {
 		return DBSecret{}, fmt.Errorf("load aws config: %w", err)
 	}
