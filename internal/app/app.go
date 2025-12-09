@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -17,8 +18,12 @@ type Application struct {
 	DB             *sql.DB
 }
 
-func NewApplication() (*Application, error) {
-	pgDB, err := store.Open()
+func NewApplication(ctx context.Context) (*Application, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	pgDB, err := store.Open(ctx)
 	if err != nil {
 		return nil, err
 	}

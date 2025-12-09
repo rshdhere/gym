@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"net/http"
@@ -16,7 +17,8 @@ func main() {
 
 	flag.IntVar(&port, "port", 8080, "go backend server port")
 	flag.Parse()
-	app, err := app.NewApplication()
+	ctx := context.Background()
+	app, err := app.NewApplication(ctx)
 	if err != nil {
 		panic(err)
 	}

@@ -40,12 +40,26 @@ const (
 )
 
 var (
-	secretCache   = make(map[string]DBSecret)
+	secretCache   = make(map[string]cachedSecret)
 	secretCacheMu sync.RWMutex
+
+	awsCfg     aws.Config
+	awsCfgOnce sync.Once
+	awsCfgErr  error
 )
 
-func Open() (*sql.DB, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+type cachedSecret struct {
+	secret    DBSecret
+	expiresAt time.Time
+}
+
+func Open(ctx context.Context) (*sql.DB, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	timeout := getenvDuration("DB_CONNECT_TIMEOUT", 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	env, rawEnv, err := envLabel()
@@ -84,6 +98,8 @@ func resolveDSN(ctx context.Context, env string) (string, string, error) {
 		return localDSNFromEnv(), "local-env-vars", nil
 	}
 
+	sslMode := getenvDefault("DB_SSL_MODE", "require")
+
 	secretName, err := selectSecretName(env)
 	if err != nil {
 		return "", "", err
@@ -95,12 +111,13 @@ func resolveDSN(ctx context.Context, env string) (string, string, error) {
 	}
 
 	return fmt.Sprintf(
-		"postgresql://%s:%s@%s:%s/%s?sslmode=require",
+		"postgresql://%s:%s@%s:%s/%s?sslmode=%s",
 		url.QueryEscape(secret.Username),
 		url.QueryEscape(secret.Password),
 		secret.Host,
 		secret.Port,
 		secret.Database,
+		sslMode,
 	), secretName, nil
 }
 
@@ -110,10 +127,11 @@ func localDSNFromEnv() string {
 	user := getenvDefault("POSTGRES_USER", "postgres")
 	pass := getenvDefault("POSTGRES_PASSWORD", "postgres")
 	db := getenvDefault("POSTGRES_DB", "postgres")
+	sslMode := getenvDefault("DB_SSL_MODE", "disable")
 
 	return fmt.Sprintf(
-		"postgresql://%s:%s@%s:%s/%s?sslmode=disable",
-		user, pass, host, port, db,
+		"postgresql://%s:%s@%s:%s/%s?sslmode=%s",
+		user, pass, host, port, db, sslMode,
 	)
 }
 
@@ -160,7 +178,7 @@ func envLabel() (string, string, error) {
 
 	switch {
 	case env == "":
-		return prodEnvVal, raw, nil
+		return localEnvVal, raw, nil
 	case strings.HasPrefix(env, "loc"):
 		return localEnvVal, raw, nil
 	case strings.HasPrefix(env, "stag"):
@@ -194,12 +212,19 @@ func getAWSRegion() string {
 	return "ap-south-1"
 }
 
+func awsConfig(ctx context.Context) (aws.Config, error) {
+	awsCfgOnce.Do(func() {
+		awsCfg, awsCfgErr = config.LoadDefaultConfig(ctx, config.WithRegion(getAWSRegion()))
+	})
+	return awsCfg, awsCfgErr
+}
+
 func fetchDBSecret(ctx context.Context, name string) (DBSecret, error) {
 	if cached, ok := loadCachedSecret(name); ok {
 		return cached, nil
 	}
 
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(getAWSRegion()))
+	cfg, err := awsConfig(ctx)
 	if err != nil {
 		return DBSecret{}, fmt.Errorf("load aws config: %w", err)
 	}
@@ -230,21 +255,40 @@ func fetchDBSecret(ctx context.Context, name string) (DBSecret, error) {
 }
 
 func loadCachedSecret(name string) (DBSecret, bool) {
-	secretCacheMu.RLock()
-	secret, ok := secretCache[name]
-	secretCacheMu.RUnlock()
-	return secret, ok
+	secretCacheMu.Lock()
+	entry, ok := secretCache[name]
+	defer secretCacheMu.Unlock()
+	if !ok {
+		return DBSecret{}, false
+	}
+
+	if time.Now().After(entry.expiresAt) {
+		delete(secretCache, name)
+		return DBSecret{}, false
+	}
+
+	return entry.secret, true
 }
 
 func storeCachedSecret(name string, secret DBSecret) {
 	secretCacheMu.Lock()
-	secretCache[name] = secret
+	secretCache[name] = cachedSecret{
+		secret:    secret,
+		expiresAt: time.Now().Add(getSecretCacheTTL()),
+	}
 	secretCacheMu.Unlock()
+}
+
+func getSecretCacheTTL() time.Duration {
+	return getenvDuration("DB_SECRET_CACHE_TTL", 5*time.Minute)
 }
 
 func configureConnectionPool(db *sql.DB) {
 	maxOpen := getenvInt("DB_MAX_OPEN_CONNS", 10)
 	maxIdle := getenvInt("DB_MAX_IDLE_CONNS", 5)
+	if maxIdle > maxOpen {
+		maxIdle = maxOpen
+	}
 	connLifetime := getenvDuration("DB_CONN_MAX_LIFETIME", 30*time.Minute)
 
 	db.SetMaxOpenConns(maxOpen)
