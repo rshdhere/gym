@@ -72,6 +72,7 @@ type SecretProvider interface {
 type defaultSecretProvider struct{}
 
 func (defaultSecretProvider) GetSecret(ctx context.Context, name string) (DBSecret, error) {
+	// [0.7.1] default provider delegates to fetchDBSecret
 	return fetchDBSecret(ctx, name)
 }
 
